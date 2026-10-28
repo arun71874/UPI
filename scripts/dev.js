@@ -29,10 +29,10 @@ if (tunnelCmd && tunnelCmd.trim()) {
 }
 
 // 2. Start Control Center supervisor and launch all services
-console.log('[2/2] Launching Local Process Control Center on port 8090...');
-const cc = await startControlCenter(8090);
+console.log('[2/2] Launching Local Process Control Center...');
+const cc = await startControlCenter();
 
-console.log('\n[✓] Control Center is online at: http://localhost:8090');
+console.log(`\n[✓] Control Center is online at: http://localhost:${cc.port}`);
 console.log('[*] Starting all modular gateway services...\n');
 
 await cc.processManager.startAll();
