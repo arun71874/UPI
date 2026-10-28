@@ -16,6 +16,8 @@ export class WebhookEngine {
     this.merchantRepo = options.merchantRepo;
     this.sessionRepo = options.sessionRepo || new PaymentSessionRepository(this.db);
     this.maxRetries = Math.max(2, Math.min(20, Number(options.maxRetries) || 5));
+    this._outboxCursor = null;
+    this._missingDeliveriesCursor = null;
   }
 
   /**
@@ -289,24 +291,76 @@ export class WebhookEngine {
    * historic SUCCESS rows are never swept into webhooks on upgrade.
    */
   async recoverOutbox() {
-    const rows = this.db.query(`
-      SELECT o.payment_id, o.event_type
-      FROM payment_webhook_outbox o
-      WHERE NOT EXISTS (
-        SELECT 1 FROM webhook_deliveries d
-        WHERE d.payment_id = o.payment_id AND d.event_type = o.event_type
-      )
-      ORDER BY o.created_at, o.payment_id LIMIT 20
-    `);
+    const batchLimit = Math.max(1, Number(process.env.WEBHOOK_OUTBOX_BATCH_SIZE || 20));
+    const maxScanBudget = Math.max(batchLimit, Number(process.env.WEBHOOK_RECOVERY_SCAN_BUDGET || 500));
+    const chunkSize = Math.max(1, Math.min(maxScanBudget, Number(process.env.WEBHOOK_RECOVERY_CHUNK_SIZE || 50)));
     const outcomes = [];
-    for (const row of rows) {
-      const session = this.sessionRepo.findById(row.payment_id);
-      if (!session) continue;
-      const merchant = this.merchantRepo.findById(session.merchantId);
-      // Keep unconfigured merchants' events in the outbox for human remediation.
-      if (!merchant?.webhookUrl || !merchant.webhookSecret) continue;
-      outcomes.push(await this.dispatch(row.event_type, session));
+    const merchantCache = new Map();
+    let scannedCount = 0;
+
+    while (outcomes.length < batchLimit && scannedCount < maxScanBudget) {
+      let rows;
+      if (this._outboxCursor) {
+        rows = this.db.query(`
+          SELECT o.payment_id, o.event_type, o.created_at
+          FROM payment_webhook_outbox o
+          WHERE NOT EXISTS (
+            SELECT 1 FROM webhook_deliveries d
+            WHERE d.payment_id = o.payment_id AND d.event_type = o.event_type
+          )
+          AND (o.created_at > ? OR (o.created_at = ? AND o.payment_id > ?))
+          ORDER BY o.created_at, o.payment_id
+          LIMIT ?
+        `, [this._outboxCursor.createdAt, this._outboxCursor.createdAt, this._outboxCursor.paymentId, chunkSize]);
+      } else {
+        rows = this.db.query(`
+          SELECT o.payment_id, o.event_type, o.created_at
+          FROM payment_webhook_outbox o
+          WHERE NOT EXISTS (
+            SELECT 1 FROM webhook_deliveries d
+            WHERE d.payment_id = o.payment_id AND d.event_type = o.event_type
+          )
+          ORDER BY o.created_at, o.payment_id
+          LIMIT ?
+        `, [chunkSize]);
+      }
+
+      if (!rows || rows.length === 0) {
+        this._outboxCursor = null;
+        break;
+      }
+
+      for (const row of rows) {
+        scannedCount++;
+        this._outboxCursor = { createdAt: row.created_at, paymentId: row.payment_id };
+        const session = this.sessionRepo.findById(row.payment_id);
+        if (!session) continue;
+
+        let mStatus = merchantCache.get(session.merchantId);
+        if (!mStatus) {
+          const merchant = this.merchantRepo.findById(session.merchantId);
+          const eligible = Boolean(
+            merchant?.webhookUrl &&
+            merchant?.webhookSecret &&
+            validateOutboundWebhookUrl(merchant.webhookUrl).valid
+          );
+          mStatus = { eligible, merchant };
+          merchantCache.set(session.merchantId, mStatus);
+        }
+
+        // Keep unconfigured or invalid merchants' events in the outbox for human remediation.
+        if (!mStatus.eligible) continue;
+
+        outcomes.push(await this.dispatch(row.event_type, session));
+        if (outcomes.length >= batchLimit) break;
+      }
+
+      if (rows.length < chunkSize) {
+        this._outboxCursor = null;
+        break;
+      }
     }
+
     return outcomes;
   }
 
@@ -333,51 +387,95 @@ export class WebhookEngine {
       recoveredCount += Number(res?.changes || 0);
     }
 
-    // Find terminal payment sessions for merchants with configured webhooks that have NO webhook_deliveries row at all.
-    const orphanedSessions = this.db.query(`
-      SELECT ps.*
-      FROM payment_sessions ps
-      JOIN merchants m ON m.id = ps.merchant_id
-      WHERE ps.status IN ('SUCCESS', 'FAILED', 'EXPIRED', 'CANCELLED')
-        AND m.webhook_url IS NOT NULL AND m.webhook_url != ''
-        AND m.webhook_secret IS NOT NULL AND m.webhook_secret != ''
-        AND NOT EXISTS (
-          SELECT 1 FROM webhook_deliveries wd WHERE wd.payment_id = ps.id
-        )
-      LIMIT 100
-    `);
+    const targetBatchLimit = Math.max(1, Number(process.env.WEBHOOK_MISSING_BATCH_SIZE || 100));
+    const maxScanBudget = Math.max(targetBatchLimit, Number(process.env.WEBHOOK_RECOVERY_SCAN_BUDGET || 500));
+    const chunkSize = Math.max(1, Math.min(maxScanBudget, Number(process.env.WEBHOOK_RECOVERY_CHUNK_SIZE || 50)));
+    const merchantCache = new Map();
+    let scannedCount = 0;
 
-    for (const sessionRow of orphanedSessions) {
-      const merchant = this.merchantRepo.findById(sessionRow.merchant_id);
-      if (!merchant || !merchant.webhookUrl || !merchant.webhookSecret) continue;
+    while (recoveredCount < targetBatchLimit && scannedCount < maxScanBudget) {
+      let orphanedSessions;
+      if (this._missingDeliveriesCursor) {
+        orphanedSessions = this.db.query(`
+          SELECT ps.*, m.webhook_url, m.webhook_secret
+          FROM payment_sessions ps
+          JOIN merchants m ON m.id = ps.merchant_id
+          WHERE ps.status IN ('SUCCESS', 'FAILED', 'EXPIRED', 'CANCELLED')
+            AND m.webhook_url IS NOT NULL AND m.webhook_url != ''
+            AND m.webhook_secret IS NOT NULL AND m.webhook_secret != ''
+            AND NOT EXISTS (
+              SELECT 1 FROM webhook_deliveries wd WHERE wd.payment_id = ps.id
+            )
+            AND (ps.created_at > ? OR (ps.created_at = ? AND ps.id > ?))
+          ORDER BY ps.created_at, ps.id
+          LIMIT ?
+        `, [this._missingDeliveriesCursor.createdAt, this._missingDeliveriesCursor.createdAt, this._missingDeliveriesCursor.id, chunkSize]);
+      } else {
+        orphanedSessions = this.db.query(`
+          SELECT ps.*, m.webhook_url, m.webhook_secret
+          FROM payment_sessions ps
+          JOIN merchants m ON m.id = ps.merchant_id
+          WHERE ps.status IN ('SUCCESS', 'FAILED', 'EXPIRED', 'CANCELLED')
+            AND m.webhook_url IS NOT NULL AND m.webhook_url != ''
+            AND m.webhook_secret IS NOT NULL AND m.webhook_secret != ''
+            AND NOT EXISTS (
+              SELECT 1 FROM webhook_deliveries wd WHERE wd.payment_id = ps.id
+            )
+          ORDER BY ps.created_at, ps.id
+          LIMIT ?
+        `, [chunkSize]);
+      }
 
-      const endpointCheck = validateOutboundWebhookUrl(merchant.webhookUrl);
-      if (!endpointCheck.valid) continue;
+      if (!orphanedSessions || orphanedSessions.length === 0) {
+        this._missingDeliveriesCursor = null;
+        break;
+      }
 
-      const publicOutcome = isDispatchableOutcome(sessionRow.status)
-        ? toPublicOutcome(sessionRow.status)
-        : sessionRow.status;
-      const deliveryId = crypto.randomUUID();
-      const timestampNum = Date.now();
-      const payloadObj = this._buildPayload(publicOutcome, sessionRow, deliveryId, timestampNum);
-      const payloadString = JSON.stringify(payloadObj);
+      for (const sessionRow of orphanedSessions) {
+        scannedCount++;
+        this._missingDeliveriesCursor = { createdAt: sessionRow.created_at, id: sessionRow.id };
 
-      this.db.execute(`
-        INSERT INTO webhook_deliveries (
-          id, merchant_id, payment_id, event_type, payload, endpoint_url,
-          response_status, response_body, attempt_count, is_successful, next_retry_at, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, 0, 0, ?, ?)
-      `, [
-        deliveryId,
-        merchant.id,
-        sessionRow.id,
-        publicOutcome,
-        payloadString,
-        merchant.webhookUrl,
-        nowIso,
-        nowIso
-      ]);
-      recoveredCount++;
+        let mStatus = merchantCache.get(sessionRow.merchant_id);
+        if (!mStatus) {
+          const endpointCheck = validateOutboundWebhookUrl(sessionRow.webhook_url);
+          mStatus = { valid: endpointCheck.valid, endpointCheck };
+          merchantCache.set(sessionRow.merchant_id, mStatus);
+        }
+
+        if (!mStatus.valid) continue;
+
+        const publicOutcome = isDispatchableOutcome(sessionRow.status)
+          ? toPublicOutcome(sessionRow.status)
+          : sessionRow.status;
+        const deliveryId = crypto.randomUUID();
+        const timestampNum = Date.now();
+        const payloadObj = this._buildPayload(publicOutcome, sessionRow, deliveryId, timestampNum);
+        const payloadString = JSON.stringify(payloadObj);
+
+        this.db.execute(`
+          INSERT INTO webhook_deliveries (
+            id, merchant_id, payment_id, event_type, payload, endpoint_url,
+            response_status, response_body, attempt_count, is_successful, next_retry_at, created_at
+          ) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, 0, 0, ?, ?)
+        `, [
+          deliveryId,
+          sessionRow.merchant_id,
+          sessionRow.id,
+          publicOutcome,
+          payloadString,
+          sessionRow.webhook_url,
+          nowIso,
+          nowIso
+        ]);
+        this.db.execute('DELETE FROM payment_webhook_outbox WHERE payment_id = ?', [sessionRow.id]);
+        recoveredCount++;
+        if (recoveredCount >= targetBatchLimit) break;
+      }
+
+      if (orphanedSessions.length < chunkSize) {
+        this._missingDeliveriesCursor = null;
+        break;
+      }
     }
 
     return recoveredCount;
@@ -504,6 +602,10 @@ export class WebhookEngine {
         SET is_successful = ?, response_status = ?, response_body = ?, next_retry_at = ?
         WHERE id = ?
       `, [isSuccess ? 1 : 0, respStatus, respBody, nextRetryAt, item.id]);
+
+      if (isSuccess) {
+        this.db.execute('DELETE FROM payment_webhook_outbox WHERE payment_id = ?', [item.payment_id]);
+      }
 
       results.push({ id: item.id, success: isSuccess, attempt: nextAttempt });
     }
