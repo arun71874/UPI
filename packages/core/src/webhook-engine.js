@@ -304,6 +304,7 @@ export class WebhookEngine {
       const chunkSize = Math.max(1, Math.min(maxScanBudget, Number(options.chunkSize || process.env.WEBHOOK_RECOVERY_CHUNK_SIZE || 50)));
       const outcomes = [];
       const merchantCache = new Map();
+      const warnedMerchants = new Set();
       let scannedCount = 0;
       let currentCursor = cursor;
 
@@ -348,17 +349,24 @@ export class WebhookEngine {
           let mStatus = merchantCache.get(session.merchantId);
           if (!mStatus) {
             const merchant = this.merchantRepo.findById(session.merchantId);
-            const eligible = Boolean(
-              merchant?.webhookUrl &&
-              merchant?.webhookSecret &&
-              validateOutboundWebhookUrl(merchant.webhookUrl).valid
-            );
-            mStatus = { eligible, merchant };
+            const urlCheck = merchant?.webhookUrl ? validateOutboundWebhookUrl(merchant.webhookUrl) : { valid: false, error: 'URL not configured' };
+            const eligible = Boolean(merchant?.webhookSecret && urlCheck.valid);
+            mStatus = {
+              eligible,
+              merchant,
+              error: !merchant?.webhookSecret ? 'webhookSecret not configured' : urlCheck.error
+            };
             merchantCache.set(session.merchantId, mStatus);
           }
 
           // Keep unconfigured or invalid merchants' events in the outbox for human remediation.
-          if (!mStatus.eligible) continue;
+          if (!mStatus.eligible) {
+            if (!warnedMerchants.has(session.merchantId)) {
+              warnedMerchants.add(session.merchantId);
+              console.warn(`[webhook] Retaining outbox events for merchant ${session.merchantId}: endpoint blocked (${mStatus.error})`);
+            }
+            continue;
+          }
 
           outcomes.push(await this.dispatch(row.event_type, session));
           if (outcomes.length >= batchLimit) break;
@@ -370,6 +378,12 @@ export class WebhookEngine {
         }
       }
 
+      // Guard against stale persistent cursors: reset if sweep made no forward dispatch progress
+      if (outcomes.length === 0) {
+        currentCursor = null;
+      }
+
+      merchantCache.clear();
       this._outboxCursor = currentCursor;
       return outcomes;
     } finally {
@@ -407,6 +421,7 @@ export class WebhookEngine {
       const maxScanBudget = Math.max(targetBatchLimit, Number(options.maxScanBudget || process.env.WEBHOOK_RECOVERY_SCAN_BUDGET || 500));
       const chunkSize = Math.max(1, Math.min(maxScanBudget, Number(options.chunkSize || process.env.WEBHOOK_RECOVERY_CHUNK_SIZE || 50)));
       const merchantCache = new Map();
+      const warnedMerchants = new Set();
       let scannedCount = 0;
       let currentCursor = cursor;
 
@@ -459,7 +474,13 @@ export class WebhookEngine {
             merchantCache.set(sessionRow.merchant_id, mStatus);
           }
 
-          if (!mStatus.valid) continue;
+          if (!mStatus.valid) {
+            if (!warnedMerchants.has(sessionRow.merchant_id)) {
+              warnedMerchants.add(sessionRow.merchant_id);
+              console.warn(`[webhook] Retaining missing delivery candidates for merchant ${sessionRow.merchant_id}: endpoint invalid (${mStatus.endpointCheck?.error || 'invalid URL'})`);
+            }
+            continue;
+          }
 
           const publicOutcome = isDispatchableOutcome(sessionRow.status)
             ? toPublicOutcome(sessionRow.status)
@@ -495,6 +516,12 @@ export class WebhookEngine {
         }
       }
 
+      // Guard against stale persistent cursors: reset if sweep made no backfill progress
+      if (recoveredCount === 0) {
+        currentCursor = null;
+      }
+
+      merchantCache.clear();
       this._missingDeliveriesCursor = currentCursor;
       return recoveredCount;
     } finally {
