@@ -206,6 +206,9 @@ CREATE TABLE IF NOT EXISTS payment_webhook_outbox (
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
 
+CREATE INDEX IF NOT EXISTS idx_payment_webhook_outbox_created
+  ON payment_webhook_outbox (created_at, payment_id);
+
 CREATE TRIGGER IF NOT EXISTS trg_terminal_payment_webhook_outbox
 AFTER UPDATE OF status ON payment_sessions
 WHEN NEW.status IN ('SUCCESS','FAILED','EXPIRED','CANCELLED')
