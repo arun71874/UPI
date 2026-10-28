@@ -334,13 +334,17 @@
         this.backdrop.classList.remove('active');
       }
 
+      // The closing modal may no longer be the current one when its animation ends.
+      const closingBackdrop = this.backdrop;
       setTimeout(() => {
-        if (this.backdrop && this.backdrop.parentNode) {
-          this.backdrop.parentNode.removeChild(this.backdrop);
+        if (closingBackdrop && closingBackdrop.parentNode) {
+          closingBackdrop.parentNode.removeChild(closingBackdrop);
         }
-        this.backdrop = null;
-        this.container = null;
-        this.iframe = null;
+        if (this.backdrop === closingBackdrop) {
+          this.backdrop = null;
+          this.container = null;
+          this.iframe = null;
+        }
 
         if (typeof this.options.onClose === 'function') {
           this.options.onClose();
@@ -454,6 +458,7 @@
       const rawData = e.data.data || e.data;
 
       if (event === 'youpi.payment_success') {
+        const successBackdrop = this.backdrop;
         const payload = e.data.data || {};
         const result = {
           status: 'SUCCESS',
@@ -477,6 +482,7 @@
         }
 
         setTimeout(() => {
+          if (!this.isOpen || this.backdrop !== successBackdrop) return;
           this.close(() => {
             if (this.options.successUrl) {
               const delim = this.options.successUrl.includes('?') ? '&' : '?';
