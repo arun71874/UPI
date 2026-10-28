@@ -297,13 +297,13 @@ export class WebhookEngine {
   async recoverOutbox(options = {}) {
     if (this._isRecoveringOutbox) return [];
     this._isRecoveringOutbox = true;
+    const merchantCache = new Map();
     try {
       const cursor = options.cursor !== undefined ? options.cursor : this._outboxCursor;
       const batchLimit = Math.max(1, Number(options.batchLimit || process.env.WEBHOOK_OUTBOX_BATCH_SIZE || 20));
       const maxScanBudget = Math.max(batchLimit, Number(options.maxScanBudget || process.env.WEBHOOK_RECOVERY_SCAN_BUDGET || 500));
       const chunkSize = Math.max(1, Math.min(maxScanBudget, Number(options.chunkSize || process.env.WEBHOOK_RECOVERY_CHUNK_SIZE || 50)));
       const outcomes = [];
-      const merchantCache = new Map();
       const warnedMerchants = new Set();
       let scannedCount = 0;
       let currentCursor = cursor;
@@ -383,10 +383,10 @@ export class WebhookEngine {
         currentCursor = null;
       }
 
-      merchantCache.clear();
       this._outboxCursor = currentCursor;
       return outcomes;
     } finally {
+      merchantCache.clear();
       this._isRecoveringOutbox = false;
     }
   }
@@ -401,6 +401,7 @@ export class WebhookEngine {
   recoverMissingDeliveries(options = {}) {
     if (this._isRecoveringMissing) return 0;
     this._isRecoveringMissing = true;
+    const merchantCache = new Map();
     try {
       const { resetInFlight = false, cursor = this._missingDeliveriesCursor } = options;
       const nowIso = new Date().toISOString();
@@ -420,7 +421,6 @@ export class WebhookEngine {
       const targetBatchLimit = Math.max(1, Number(options.batchLimit || process.env.WEBHOOK_MISSING_BATCH_SIZE || 100));
       const maxScanBudget = Math.max(targetBatchLimit, Number(options.maxScanBudget || process.env.WEBHOOK_RECOVERY_SCAN_BUDGET || 500));
       const chunkSize = Math.max(1, Math.min(maxScanBudget, Number(options.chunkSize || process.env.WEBHOOK_RECOVERY_CHUNK_SIZE || 50)));
-      const merchantCache = new Map();
       const warnedMerchants = new Set();
       let scannedCount = 0;
       let currentCursor = cursor;
@@ -521,10 +521,10 @@ export class WebhookEngine {
         currentCursor = null;
       }
 
-      merchantCache.clear();
       this._missingDeliveriesCursor = currentCursor;
       return recoveredCount;
     } finally {
+      merchantCache.clear();
       this._isRecoveringMissing = false;
     }
   }
