@@ -105,8 +105,8 @@ export class WebhookEngine {
     // is missing or unsafe, KEEP that entry instead of recording an irrecoverable
     // synthetic failure row; the operator can repair configuration and replay.
     const isOutboxed = Boolean(this.db.queryOne(
-      'SELECT payment_id FROM payment_webhook_outbox WHERE payment_id = ?',
-      [session.id]
+      'SELECT payment_id FROM payment_webhook_outbox WHERE payment_id = ? AND event_type = ?',
+      [session.id, publicOutcome]
     ));
 
     // Direct non-outboxed dispatches still write an auditable failure record.
@@ -210,7 +210,7 @@ export class WebhookEngine {
     }
 
     // Outbox cleanup commits together with durable delivery preparation.
-    this.db.execute('DELETE FROM payment_webhook_outbox WHERE payment_id = ?', [session.id]);
+    this.db.execute('DELETE FROM payment_webhook_outbox WHERE payment_id = ? AND event_type = ?', [session.id, publicOutcome]);
 
     const signature = generateHmac(payloadString, merchant.webhookSecret);
     const timestampedSignature = generateHmac(`${timestamp}.${payloadString}`, merchant.webhookSecret);
@@ -231,7 +231,7 @@ export class WebhookEngine {
     // that row and skip the fetch — every first dispatch returned
     // { delivered: false, status: null, error: null } because of that re-query.
     if (isOutboxed) {
-      this.db.execute('DELETE FROM payment_webhook_outbox WHERE payment_id = ?', [session.id]);
+      this.db.execute('DELETE FROM payment_webhook_outbox WHERE payment_id = ? AND event_type = ?', [session.id, publicOutcome]);
     }
 
     let responseStatus = null;
