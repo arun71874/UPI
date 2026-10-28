@@ -24,6 +24,7 @@ const testFiles = [
   'apps/merchant-admin/src/__tests__/merchant-admin.test.js',
   'apps/payment-help/src/__tests__/payment-help.test.js',
   'apps/gmail-observer/src/__tests__/gmail-poller-stop-race.test.js',
+  'apps/gmail-observer/src/__tests__/gmail-poller-pagination.test.js',
   'apps/gmail-observer/src/__tests__/gmail-observer.test.js',
   'apps/gmail-observer/src/__tests__/gmail-bank-alert-security.test.js',
   'apps/gmail-observer/src/__tests__/gmail-poller-boot-lifecycle.test.js',
